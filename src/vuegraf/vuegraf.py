@@ -89,22 +89,23 @@ def lookupChannelName(account, chan):
 def createDataPoint(account, chanName, watts, timestamp, detailed):
     dataPoint = None
     if influxVersion == 2:
-        dataPoint = influxdb_client.Point("energy_usage") \
+        #Changed below to map to Emporia Downloader
+        dataPoint = influxdb_client.Point("power") \
             .tag("account_name", account['name']) \
-            .tag("device_name", chanName) \
+            .tag("deviceName", chanName) \
             .tag("detailed", detailed) \
-            .field("usage", watts) \
+            .field("value", watts) \
             .time(time=timestamp)
     else:
         dataPoint = {
-            "measurement": "energy_usage",
+            "measurement": "power",
             "tags": {
                 "account_name": account['name'],
-                "device_name": chanName,
+                "deviceName": chanName,
                 "detailed": detailed,
             },
             "fields": {
-                "usage": watts,
+                "value": watts,
             },
             "time": timestamp
         }
@@ -133,7 +134,7 @@ def extractDataPoints(device, usageDataPoints, historyStartTime=None, historyEnd
             continue
 
         if detailedEnabled:
-            usage, usage_start_time = account['vue'].get_chart_usage(chan, detailedStartTime, stopTime, scale=Scale.SECOND.value, unit=Unit.KWH.value)
+            usage, usage_start_time = account['vue'].get_chart_usage(chan, detailedStartTime.replace(microsecond=0) , stopTime.replace(microsecond=0), scale=Scale.SECOND.value, unit=Unit.KWH.value)
             index = 0
             for kwhUsage in usage:
                 if kwhUsage is None:
@@ -143,8 +144,25 @@ def extractDataPoints(device, usageDataPoints, historyStartTime=None, historyEnd
                 usageDataPoints.append(createDataPoint(account, chanName, watts, timestamp, True))
                 index += 1
         
+
+        # fetches historical Second data
+        if historySecond:
+            historyStartTime = historyStartTime.replace(microsecond=0)
+            historyEndTime = historyEndTime.replace(microsecond=0)
+            usage, usage_start_time = account['vue'].get_chart_usage(chan, historyStartTime, historyEndTime, scale=Scale.SECOND.value, unit=Unit.KWH.value)
+            index = 0
+            for kwhUsage in usage:
+                if kwhUsage is None:
+                    continue
+                timestamp = historyStartTime + datetime.timedelta(seconds=index)
+                watts = float(secondsInAMinute * minutesInAnHour * wattsInAKw) * kwhUsage
+                usageDataPoints.append(createDataPoint(account, chanName, watts, timestamp, True))
+                index += 1
+
         # fetches historical minute data
-        if historyStartTime is not None and historyEndTime is not None:
+        if historyStartTime is not None and historyEndTime is not None and historySecond is False :
+            historyStartTime = historyStartTime.replace(second=0, microsecond=0)
+            historyEndTime = historyEndTime.replace(second=0, microsecond=0)
             usage, usage_start_time = account['vue'].get_chart_usage(chan, historyStartTime, historyEndTime, scale=Scale.MINUTE.value, unit=Unit.KWH.value)
             index = 0
             for kwhUsage in usage:
@@ -156,6 +174,7 @@ def extractDataPoints(device, usageDataPoints, historyStartTime=None, historyEnd
                 index += 1
 
 startupTime = datetime.datetime.utcnow()
+historySecond = False
 try:
     if len(sys.argv) != 2:
         print('Usage: python {} <config-file>'.format(sys.argv[0]))
@@ -198,7 +217,7 @@ try:
             delete_api = influx2.delete_api()
             start = "1970-01-01T00:00:00Z"
             stop = startupTime.isoformat(timespec='seconds')
-            delete_api.delete(start, stop, '_measurement="energy_usage"', bucket=bucket, org=org)    
+            delete_api.delete(start, stop, '_measurement="power"', bucket=bucket, org=org)    
     else:
         info('Using InfluxDB version 1')
 
@@ -216,11 +235,12 @@ try:
 
         if config['influxDb']['reset']:
             info('Resetting database')
-            influx.delete_series(measurement='energy_usage')
+            influx.delete_series(measurement='power')
 
     historyDays = min(config['influxDb'].get('historyDays', 0), 7)
     history = historyDays > 0
 
+   
     running = True
 
     signal.signal(signal.SIGINT, handleExit)
@@ -229,7 +249,8 @@ try:
     pauseEvent = Event()
 
     intervalSecs=getConfigValue("updateIntervalSecs", 60)
-    detailedIntervalSecs=getConfigValue("detailedIntervalSecs", 3600)
+    #Changed detailed to get every minute (instead of hour)
+    detailedIntervalSecs=getConfigValue("detailedIntervalSecs", 60)
     lagSecs=getConfigValue("lagSecs", 5)
     detailedStartTime = startupTime
 
@@ -247,6 +268,7 @@ try:
 
             try:
                 deviceGids = list(account['deviceIdMap'].keys())
+                stopTime = stopTime.replace(second=0, microsecond=0)
                 usages = account['vue'].get_device_list_usage(deviceGids, stopTime, scale=Scale.MINUTE.value, unit=Unit.KWH.value)
                 if usages is not None:
                     usageDataPoints = []
@@ -254,6 +276,25 @@ try:
                         extractDataPoints(device, usageDataPoints)
 
                     if history:
+                        #Get Per Second History in 3 chunks (1h each)
+                        info('Loading second historical data past 3h ago')
+                        historySecond = True
+                        historyStartTime = stopTime - datetime.timedelta(seconds=3600)
+                        historyEndTime = stopTime - datetime.timedelta(seconds=1)
+                        for gid, device in usages.items():
+                                extractDataPoints(device, usageDataPoints, historyStartTime, historyEndTime)
+                        
+                        historyStartTime = stopTime - datetime.timedelta(seconds=7200)
+                        historyEndTime = stopTime - datetime.timedelta(seconds=3600)
+                        for gid, device in usages.items():
+                                 extractDataPoints(device, usageDataPoints, historyStartTime, historyEndTime)                        
+                        
+                        historyStartTime = stopTime - datetime.timedelta(seconds=10800)
+                        historyEndTime = stopTime - datetime.timedelta(seconds=7200)
+                        for gid, device in usages.items():
+                                 extractDataPoints(device, usageDataPoints, historyStartTime, historyEndTime)    
+                        historySecond = False
+
                         for day in range(historyDays):
                             info('Loading historical data: {} day ago'.format(day+1))
                             #Extract second 12h of day
@@ -261,7 +302,6 @@ try:
                             historyEndTime = stopTime - datetime.timedelta(seconds=(3600*24*(day)))
                             for gid, device in usages.items():
                                 extractDataPoints(device, usageDataPoints, historyStartTime, historyEndTime)
-                            pauseEvent.wait(5)
                             #Extract first 12h of day
                             historyStartTime = stopTime - datetime.timedelta(seconds=3600*24*(day+1))
                             historyEndTime = stopTime - datetime.timedelta(seconds=(3600*24*(day+1))-43200)
@@ -269,8 +309,10 @@ try:
                                 extractDataPoints(device, usageDataPoints, historyStartTime, historyEndTime)
                             if not running:
                                 break
-                            pauseEvent.wait(5)
+                            pauseEvent.wait(1)
+
                         history = False
+
 
                     if not running:
                         break
